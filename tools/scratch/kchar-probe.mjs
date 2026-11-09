@@ -1,0 +1,11 @@
+import { Scene } from '../../engine/src/world/Scene.js';
+import { LevelBuilder, MapKind } from '../../engine/src/world/LevelBuilder.js';
+import { KinematicCharacter } from '../../engine/src/physics/KinematicCharacter.js';
+const scene = new Scene({ Name: 'probe' });
+const built = new LevelBuilder(scene, { kind: MapKind.Arena, seed: 11, size: 56 }).build({ withNav: false });
+const spawn = built.spawns.blue[0];
+console.log('spawn type:', spawn?.constructor?.name, spawn);
+const kc = KinematicCharacter.create(scene, { position: spawn });
+console.log('kc.position type:', kc.position?.constructor?.name, 'set?', typeof kc.position?.set, 'clone?', typeof kc.position?.clone);
+kc.update(1/60, { moveX: 0, moveY: 1 });
+console.log('after update', kc.position.x, kc.position.y, kc.position.z, 'grounded', kc.onGround);

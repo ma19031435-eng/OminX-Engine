@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>OminX Engine — Studio</title>
+<meta name="description" content="OminX Engine: a WebGPU-first FPS engine and level editor that runs entirely in the browser." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0f14'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%23ffb347' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='2' fill='%2357b6ff'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+
+<!-- ------------------------------------------------------------------ Studio chrome -->
+<div class="studio" id="studio">
+
+  <header class="toolbar" id="toolbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-name">OminX <small>Studio</small></span>
+    </div>
+    <div class="toolbar-group" data-group="file">
+      <button class="tool" data-action="new-map" title="Generate a new map (Ctrl+N)">New</button>
+      <button class="tool" data-action="open-slot" title="Load the autosaved project">Open</button>
+      <button class="tool" data-action="save-slot" title="Save to the browser (Ctrl+S)">Save</button>
+      <button class="tool" data-action="download-project" title="Download project JSON">Download</button>
+      <button class="tool" data-action="export-html" title="Build a standalone HTML game">Build</button>
+    </div>
+    <div class="toolbar-group" data-group="tools">
+      <button class="tool" data-action="tool-select" data-tool="select" title="Select (Q)">Select</button>
+      <button class="tool active" data-action="tool-move" data-tool="move" title="Move (W)">Move</button>
+      <button class="tool" data-action="tool-rotate" data-tool="rotate" title="Rotate (E)">Rotate</button>
+      <button class="tool" data-action="tool-scale" data-tool="scale" title="Scale (R)">Scale</button>
+      <button class="tool" data-action="toggle-snap" title="Grid snapping (Shift+S)">Snap</button>
+      <button class="tool" data-action="toggle-space" title="World / local space (X)">World</button>
+    </div>
+    <div class="toolbar-group" data-group="edit">
+      <button class="tool" data-action="undo" title="Undo (Ctrl+Z)">Undo</button>
+      <button class="tool" data-action="redo" title="Redo (Ctrl+Y)">Redo</button>
+      <button class="tool" data-action="duplicate" title="Duplicate (Ctrl+D)">Duplicate</button>
+      <button class="tool danger" data-action="delete" title="Delete (Delete)">Delete</button>
+    </div>
+    <div class="toolbar-group" data-group="insert">
+      <button class="tool" data-action="add-part" title="Insert a part">Part</button>
+      <button class="tool" data-action="add-spawn" title="Insert a spawn point">Spawn</button>
+      <button class="tool" data-action="add-objective" title="Insert a capture point">Objective</button>
+      <button class="tool" data-action="add-light" title="Insert a light">Light</button>
+      <button class="tool" data-action="rebuild-nav" title="Rebuild the AI navmesh">Nav</button>
+    </div>
+    <div class="toolbar-spacer"></div>
+    <div class="toolbar-group" data-group="play">
+      <label class="tool checkbox" title="Restore the edited scene when play mode stops">
+        <input type="checkbox" id="play-restore" checked /> Restore on stop
+      </label>
+      <button class="tool accent" data-action="play" title="Play the game (F5)">▶ Play</button>
+      <button class="tool" data-action="play-bots" title="Play with 5v5 bots (F6)">▶ 5v5</button>
+      <button class="tool" data-action="stop" title="Stop (Shift+F5)">■ Stop</button>
+      <span class="status-bars" id="studio-status"></span>
+    </div>
+  </header>
+
+  <div class="studio-body">
+    <!-- left dock -->
+    <aside class="panel panel-left" id="panel-left">
+      <div class="panel-tabs" data-tabs="left">
+        <button class="tab active" data-tab="hierarchy">Explorer</button>
+        <button class="tab" data-tab="assets">Assets</button>
+        <button class="tab" data-tab="scripts">Scripts</button>
+      </div>
+
+      <div class="tab-page active" data-page="hierarchy">
+        <div class="search-row"><input id="tree-search" type="search" placeholder="Filter instances…" /></div>
+        <div class="tree" id="hierarchy" role="tree" aria-label="Scene hierarchy"></div>
+      </div>
+
+      <div class="tab-page" data-page="assets">
+        <div class="search-row"><input id="asset-search" type="search" placeholder="Search props, materials, weapons…" /></div>
+        <div class="asset-browser" id="asset-browser"></div>
+      </div>
+
+      <div class="tab-page" data-page="scripts">
+        <div class="script-actions">
+          <button class="tool" data-action="script-new">New script</button>
+          <button class="tool" data-action="script-run">Run</button>
+          <button class="tool" data-action="script-stop">Stop all</button>
+        </div>
+        <div class="script-list" id="script-list"></div>
+        <div class="script-editor" id="script-editor" spellcheck="false"></div>
+        <div class="script-output" id="script-output"></div>
+      </div>
+    </aside>
+
+    <!-- viewport -->
+    <main class="viewport-wrap" id="viewport-wrap">
+      <div class="viewport" id="viewport">
+        <canvas id="canvas" class="render-canvas"></canvas>
+        <canvas id="hud-canvas" class="hud-canvas"></canvas>
+        <div class="hud-root" id="hud-root"></div>
+        <div class="viewport-stats" id="viewport-stats">booting…</div>
+        <div class="gizmo-hint" id="gizmo-hint"></div>
+        <div class="dialog" id="dialog" hidden>
+          <div class="dialog-card">
+            <h2 id="dialog-title">Notice</h2>
+            <p id="dialog-body"></p>
+            <div class="menu-actions">
+              <button class="tool accent" id="dialog-ok">OK</button>
+              <button class="tool" id="dialog-cancel" hidden>Cancel</button>
+            </div>
+          </div>
+        </div>
+        <div class="menu-overlay" id="menu" hidden>
+          <div class="menu-card">
+            <h2 id="menu-title">Paused</h2>
+            <div class="settings-grid" id="menu-settings"></div>
+            <div class="menu-actions">
+              <button class="tool accent" data-action="resume">Resume</button>
+              <button class="tool" data-action="restart">Restart match</button>
+              <button class="tool" data-action="leave">Back to Studio</button>
+            </div>
+            <div class="menu-footer"><span id="menu-backend">—</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="play-chrome" id="play-chrome" hidden>
+        <div class="play-topbar">
+          <span class="play-info" id="play-info">—</span>
+          <span class="play-hint" id="play-hint">M: menu · Tab: scores · F5: restart · F6: enter/leave mouse</span>
+        </div>
+      </div>
+    </main>
+
+    <!-- right dock -->
+    <aside class="panel panel-right" id="panel-right">
+      <div class="panel-tabs" data-tabs="right">
+        <button class="tab active" data-tab="properties">Properties</button>
+        <button class="tab" data-tab="environment">Environment</button>
+        <button class="tab" data-tab="network">Network</button>
+      </div>
+
+      <div class="tab-page active" data-page="properties">
+        <div class="selection-header" id="selection-header">
+          <span class="class-tag" id="selection-class">nothing selected</span>
+          <input type="text" id="selection-name" placeholder="name" disabled />
+        </div>
+        <div class="inspector" id="inspector"></div>
+      </div>
+
+      <div class="tab-page" data-page="environment">
+        <div class="settings-grid" id="environment-panel"></div>
+        <div id="environment-extra"></div>
+      </div>
+
+      <div class="tab-page" data-page="network">
+        <div class="settings-grid">
+          <div class="setting-row"><input type="text" id="net-url" placeholder="ws://localhost:8787" /></div>
+          <button class="tool" data-action="net-connect" id="net-connect">Connect</button>
+          <button class="tool" data-action="net-disconnect" id="net-disconnect">Disconnect</button>
+        </div>
+        <div id="net-players"></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- bottom dock -->
+  <section class="console" id="console">
+    <div class="console-head" id="console-head">
+      <span class="console-title">Output</span>
+      <div class="console-filters" id="console-filters">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="info">Info</button>
+        <button class="chip" data-filter="warn">Warnings</button>
+        <button class="chip" data-filter="error">Errors</button>
+      </div>
+      <div class="console-spacer"></div>
+      <button class="tool" data-action="console-clear">Clear</button>
+      <button class="tool" data-action="console-collapse" id="console-collapse">▾</button>
+    </div>
+    <div class="console-body" id="console-body"></div>
+    <div class="console-input">
+      <span class="prompt">&gt;</span>
+      <input type="text" id="console-input" placeholder="type a command — help, spawn, select, play, set, bots, quality, nav…" autocomplete="off" spellcheck="false" />
+    </div>
+  </section>
+</div>
+
+<!-- ------------------------------------------------------------------ loading -->
+<div class="loading" id="loading">
+  <div class="loading-card">
+    <div class="loading-logo"></div>
+    <h1>OminX Engine</h1>
+    <p id="loading-status">booting…</p>
+    <div class="loading-bar"><span id="loading-progress"></span></div>
+    <div class="loading-log" id="loading-log"></div>
+  </div>
+</div>
+
+<noscript>
+  <p style="color:#dbe4ee;font-family:system-ui;padding:24px">OminX Engine needs JavaScript and WebGPU (or WebGL2).</p>
+</noscript>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
