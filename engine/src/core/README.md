@@ -3,7 +3,10 @@
 The core is the part of the engine that does not know what a gun is. It is the object model,
 lifetime management, configuration, content, scheduling, composition and profiling that everything
 else — renderer, physics, gameplay, editor — is built out of. It runs headless, it runs in a browser,
-and it is testable without a GPU: `node --test tests/core.test.js` is 84 tests in ~0.5 s.
+and it is testable without a GPU: `node --test tests/core.test.js` is 99 tests in ~0.6 s.
+
+The core has **32 modules** (layer 1 → layer 5), all reachable from `index.js`, from the engine
+object, and from the console.
 
 ## Layering
 
@@ -12,11 +15,11 @@ a worker, or inside a 4 ms frame budget.
 
 | Layer | Modules | Responsibility |
 | --- | --- | --- |
-| 1 — Foundations | `Logger` `Delegate` `Signal` `Containers` `Stats` `Trace` | Logging, event delivery, data structures, measurement |
+| 1 — Foundations | `Logger` `Delegate` `Signal` `Containers` `Stats` `Trace` `Schema` `Diagnostics` | Logging, event delivery, data structures, measurement, reflected field types, assertion/error hub |
 | 2 — Object model | `Object` `GarbageCollector` `Memory` | Reflection, identity, lifetimes, allocation |
-| 3 — Services | `Config` `Console` `AssetRegistry` `Localization` `JobGraph` `TimerManager` `Curve` `EventBus` `Async` | Settings, commands, content, text, frame work, timing, feel, messaging, off-frame work |
+| 3 — Services | `Config` `Console` `AssetRegistry` `Localization` `JobGraph` `TimerManager` `Curve` `EventBus` `Async` `DataRegistry` | Settings, commands, content, text, frame work, timing, feel, messaging, off-frame work, typed data tables |
 | 4 — Composition | `Subsystem` `ModuleManager` `Plugin` | What the engine is made of, and how it is extended |
-| 5 — Runtime | `Scheduler` `EngineCore` `InputMapping` `Replay` `Archive` `SaveGame` | One clock, one engine object, input, playback, serialization, saved games |
+| 5 — Runtime | `Scheduler` `EngineCore` `InputMapping` `Replay` `Archive` `SaveGame` `Replication` `World` | One clock, one engine object, input, playback, serialization, saved games, networked state, actors/levels |
 
 ```js
 import {
@@ -385,6 +388,87 @@ tests and headless runs. Binary records are wrapped in a marked string so string
 for both `format: 'json'` and `format: 'binary'`. Console: `save`, `save.write`, `save.read`,
 `save.delete`, `save.autosave`, `save.verify`, `save.export`.
 
+### Shared field schema (`Schema.js`)
+One vocabulary for "what type is this value?" — used by saved-game schemas, data tables, config
+columns and archive structs. A `u8` in a save slot means exactly the same thing as a `u8` in a CSV
+row. Integer widths, floats, strings, bools, `vec2/3/4`, `json`, `array:<type>`, `struct:<Name>`
+and `enum:<A|B|C>` are supported; unknown types are **forward compatible** and never reject a save
+written by a newer build.
+
+```js
+validateField('u8', 200);                      // → null
+validateField('u8', 999);                      // → 'value is outside u8 [0, 255]'
+coerceField('bool', 'yes');                    // → true  (CSV/INI import)
+coerceObject({ hp: 'u8', name: 'string' }, { hp: '7', name: 'Bot' }); // → { value, errors }
+```
+
+### Diagnostics (`Diagnostics.js`)
+UE-style `check` (fatal, throws), `ensure` (once per call site, continues), `verify` (fatal even in
+shipping), `fatal`, `assertNever`, plus `warn`/`error` with stable machine codes. The `DiagnosticHub`
+is bounded and deduplicated (`E_ENSURE` in a loop reports once), records stack sites, installs a
+fatal handler (crash overlay / upload), and exposes `diag`, `diag.errors`, `diag.codes`,
+`diag.level`, `diag.clear` and `diag.throw` to the console. `guard()` wraps a call with a fallback;
+`scope()` measures and warns on a budget overrun.
+
+```js
+check(player.isValid(), 'player {name} is not valid', { name: player.name });
+ensure(delta > 0, 'non-positive delta');
+const json = guard(() => JSON.parse(text), { code: 'E_PARSE', fallback: {} });
+engine.diagnostics.report({ level: 'warning', code: 'E_BUDGET', message: 'frame over budget' });
+```
+
+### Data registry (`DataRegistry.js`)
+Schema-validated, keyed data tables with CSV and JSON round-trips, queries, structural diffs,
+clones, and asset-backed lazy loading. Tables are the home for weapon stats, damage falloff,
+loadouts and tuning values — **data, not gameplay code**. `engine.data` is always present and
+`data`, `data.get`, `data.query`, `data.csv` and `data.validate` are installed at boot.
+
+```js
+engine.data.define('Weapons', { name: 'string', damage: 'u8', rpm: 'u16' }, { keyField: 'id' });
+engine.data.get('Weapons').add('rifle', { name: 'Rifle', damage: 24, rpm: 600 });
+engine.data.query('Weapons', { where: { rpm: 600 }, sort: { field: 'damage', descending: true } });
+engine.data.registerSource('Weapons', { loader: () => fetch('/Game/Data/Weapons.csv').then(r => r.text()), format: 'csv', schema });
+```
+
+### Replication (`Replication.js`)
+The transport-agnostic half of netcode: `src/net/Protocol.js` decides how many bytes a snapshot
+costs, this module decides **what state exists to be sent**. UE-style roles
+(`Authority` / `AutonomousProxy` / `SimulatedProxy` / `None`), per-property dirty deltas,
+per-object sequence numbers with stale-delta rejection, conflict reporting when a local authority
+receives a remote delta, relevancy filters for dormancy, reliable ordered channels with gap
+buffering, duplicates and bounded resend windows, named targetable RPCs with isolated handlers,
+and full snapshots for late join / replay.
+
+```js
+const net = engine.createReplicationSystem({ mode: NetMode.Server, localRole: NetRole.Authority });
+net.register(7, { classId: 'Player', role: NetRole.Authority, properties: { health: 100 } });
+net.setProperty(7, 'health', 82);
+const deltas = net.collectDeltas();       // → [{ netId: 7, properties: { health: 82 }, … }]
+client.applyDeltas(deltas);               // creates a simulated proxy, ordered and stale-safe
+net.onRpc(7, 'fire', (args) => shoot(args));
+```
+
+`engine.replication.tick()` runs on the fixed simulation step, so delta `tick` values match the
+server's tick. Console: `net`, `net.actors`, `net.set`, `net.flush`, `net.channels`, `net.tick`.
+
+### World, actors and components (`World.js`)
+The UE structural model, with no renderer, mesh or gameplay rule attached. `Actor` owns a root
+`SceneComponent` (a composed transform in an attachment hierarchy) plus `ActorComponent`s with
+`onInitialize / onBeginPlay / onTick / onEndPlay` hooks, activation, tick intervals and isolated
+errors. `World` owns actors and named levels, dispatches four tick groups
+(`PrePhysics → DuringPhysics → PostPhysics → PostUpdateWork`) in deterministic spawn order,
+supports actor/tag/class queries, lifespans, level streaming, snapshots, and binds to the
+replication graph so `actor.setReplicated('health', 82)` produces exactly one dirty property on
+the next `collectNetDeltas()`. Console: `world`, `world.actors`, `world.spawn`, `world.destroy`,
+`world.levels`, `world.tick`, `world.net`.
+
+```js
+engine.world.spawnActor({ name: 'RedSpawn', className: 'PlayerStart', tags: ['spawn', 'red'] },
+  { level: 'Arena', replicate: true, properties: { health: 100 } });
+engine.world.beginPlay();          // idempotent
+engine.frame(1 / 60);              // world.tick() runs on the fixed simulation step
+```
+
 ## Composition recipe
 
 ```js
@@ -427,13 +511,14 @@ const engine = await createEngine({
 ## Verification
 
 ```bash
-node --test tests/core.test.js        # 84 tests, the core contract
-node --test tests/*.test.js           # 157 tests (engine + gameplay + network + renderer)
-node tools/syntax-check.js            # 152 JS modules + 24 WGSL programs / 80 variants
+node --test tests/core.test.js        # 99 tests, the core contract
+node --test tests/*.test.js           # 172 tests (engine + gameplay + network + renderer)
+node tools/syntax-check.js            # 160 JS modules + 24 WGSL programs / 80 variants
 node tools/core-report.mjs            # boot a headless engine and print the full report
 npm run core                          # same report via npm
 npm run build                         # vite build
 ```
 
 Every module is also exercised by a scratch probe under `tools/scratch/` where the behaviour is
-easier to see printed than asserted (archive framing, plugin boot, trace export).
+easier to see printed than asserted (archive framing, plugin boot, trace export, save recovery,
+bus ordering, task cancellation, `data-registry-probe.mjs`, `replication-probe.mjs`, `world-probe.mjs`).

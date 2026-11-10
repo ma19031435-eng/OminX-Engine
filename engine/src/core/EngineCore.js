@@ -46,6 +46,10 @@ import { ReplaySystem } from './Replay.js';
 import { SaveSystem } from './SaveGame.js';
 import { MessageBus } from './EventBus.js';
 import { TaskScheduler } from './Async.js';
+import { DiagnosticHub } from './Diagnostics.js';
+import { DataRegistry } from './DataRegistry.js';
+import { ReplicationSystem } from './Replication.js';
+import { World } from './World.js';
 import { createLocalization } from './Localization.js';
 import { PluginManager, PluginTarget } from './Plugin.js';
 import { InputMappingSystem } from './InputMapping.js';
@@ -173,6 +177,33 @@ export class EngineCore extends EngineObject {
       concurrency: options.taskConcurrency ?? 4,
       maxQueue: options.taskQueueSize ?? 1024,
     });
+    /**
+     * Bounded, deduplicated assertion/error hub. A host may inject its own hub (multiple worlds,
+     * isolated tests); the module-level `check`/`ensure` helpers use the shared hub instead.
+     */
+    this.diagnostics = isDiagnosticHub(options.diagnostics) ? options.diagnostics : new DiagnosticHub({
+      name: 'OminX', capacity: options.diagnosticCapacity ?? 256,
+      minLevel: options.diagnosticMinLevel ?? 'info',
+    });
+    /** Typed, asset-backed gameplay data tables (weapon stats, damage falloff, loadouts). */
+    this.data = isDataRegistry(options.data) ? options.data : new DataRegistry({
+      name: 'GameData', assetRegistry: this.assets, ...(options.dataOptions ?? {}),
+    });
+    /**
+     * UE-style replication graph. Always present, but costs nothing until objects are registered:
+     * dirty properties are the only thing that produces a delta, and the simulation clock ticks it.
+     */
+    this.replication = isReplicationSystem(options.replication) ? options.replication : new ReplicationSystem({
+      name: 'OminX', stats: this.stats, mode: options.netMode ?? 'standalone',
+      localRole: options.netRole ?? 'none', ...(options.replicationOptions ?? {}),
+    });
+    /** UE-style world: actors, components, tick groups, levels and the replication binding. */
+    // `Object.world` is a getter backed by `setWorld()`; binding through it keeps actors and
+    // reflected objects looking up the same world instance as the engine itself.
+    this.setWorld(isWorld(options.world) ? options.world : new World({
+      name: options.worldName ?? 'OminXWorld', engine: this,
+      replication: this.replication, stats: this.stats,
+    }));
 
     this.realTime = 0;               // wall seconds since the first frame (unscaled)
     this.frameNumber = 0;
@@ -325,6 +356,10 @@ export class EngineCore extends EngineObject {
     // so movement → physics → AI holds every tick regardless of how many steps this frame ran.
     this._connections.push(scheduler.PreSimulation.connect((fixedDelta) => {
       this.tickCount++;
+      // Replication advances on the simulation clock so delta `tick` values match the server's tick.
+      this.replication.tick();
+      // Actor/component ticks run after subsystem fixed updates, in UE-style tick-group order.
+      this.trace.scope('Engine/World', 'engine', () => this.world.tick(fixedDelta));
       const stepStart = this._wallNow();
       this.subStepsLastFrame++;
       this.trace.scope('Subsystems/FixedUpdate', 'engine', () => this.subsystems.fixedUpdate(fixedDelta));
@@ -594,6 +629,33 @@ export class EngineCore extends EngineObject {
     return this.tasks;
   }
 
+  /** Creates/replaces the world (a host with its own level layout or actor allocation policy). */
+  createWorld(options = {}) {
+    this.setWorld(isWorld(options.world) ? options.world : new World({
+      name: 'OminXWorld', engine: this, replication: this.replication, stats: this.stats, ...options,
+    }));
+    this.world.installConsoleCommands(this.console);
+    return this.world;
+  }
+
+  /** Creates/replaces the replication graph (server/listen-server hosts pass `mode` and role). */
+  createReplicationSystem(options = {}) {
+    this.replication = isReplicationSystem(options.system) ? options.system : new ReplicationSystem({
+      name: 'OminX', stats: this.stats, ...options,
+    });
+    this.replication.installConsoleCommands(this.console);
+    return this.replication;
+  }
+
+  /** Creates/replaces the typed data registry (hosts pass `assetRegistry` for table streaming). */
+  createDataRegistry(options = {}) {
+    this.data = isDataRegistry(options.registry) ? options.registry : new DataRegistry({
+      name: 'GameData', assetRegistry: this.assets, ...options,
+    });
+    this.data.installConsoleCommands(this.console);
+    return this.data;
+  }
+
   /** Replaces the engine's message bus (a host with its own queue, capacity or timeout policy). */
   createMessageBus(options = {}) {
     this.messages = isMessageBus(options.bus) ? options.bus : new MessageBus({ name: 'OminX', stats: this.stats, ...options });
@@ -628,6 +690,8 @@ export class EngineCore extends EngineObject {
     this.saves?.stopAutosave();
     this.messages?.clear();
     this.tasks?.cancelAll('engine shutdown');
+    this.replication?.drainRpcs();
+    this.world?.endPlay();
     this.timers.clearAll();
     await this.plugins.shutdownAll();
     await this.modules.shutdownAll();
@@ -700,6 +764,22 @@ export class EngineCore extends EngineObject {
         completed: this.tasks.completed, failed: this.tasks.failed,
         cancelled: this.tasks.cancelled, concurrency: this.tasks.concurrency,
       },
+      diagnostics: {
+        reports: this.diagnostics.total, byLevel: { ...this.diagnostics.counts },
+        suppressed: this.diagnostics.suppressed, minLevel: this.diagnostics.minLevel,
+      },
+      data: { tables: this.data.count, rows: this.data.names().reduce((n, k) => n + (this.data.get(k)?.count ?? 0), 0) },
+      replication: {
+        objects: this.replication.count, tick: this.replication.tickCount,
+        deltasOut: this.replication.deltasSent, deltasIn: this.replication.deltasApplied,
+        stale: this.replication.staleCount, conflicts: this.replication.conflictCount,
+        queuedRpcs: this.replication.rpcQueue.length, errors: this.replication.errors.length,
+      },
+      world: {
+        name: this.world.name, actors: this.world.count, levels: this.world.levels.size,
+        tick: this.world.tickCount, ticksDispatched: this.world.ticksDispatched,
+        errors: this.world.errors.length,
+      },
     };
   }
 
@@ -714,6 +794,8 @@ export class EngineCore extends EngineObject {
       `  time ${scheduler.time.toFixed(2)}s (×${scheduler.timeScale}) · ${Math.round(scheduler.metrics.fps)} fps · ${this.lastFrameMs.toFixed(2)} ms/frame · ${this.subStepsLastFrame} substeps`,
       `  objects ${liveObjectCount()} live / ${getClassCount()} classes · ${this.collector.pendingCount} pending kill`,
       `  culture ${this.localization.culture}${this.localization.isRightToLeft ? ' (RTL)' : ''} · plugins ${this.plugins.loadedCount}/${this.plugins.count} loaded · ${this.timers.count} timers · ${this.saves.slotKeys().length} saves · ${this.messages.count} messages · ${this.tasks.activeCount} tasks`,
+      `  diagnostics ${this.diagnostics.total} reports (${this.diagnostics.counts.error} error / ${this.diagnostics.counts.fatal} fatal) · data ${this.data.count} tables · net ${this.replication.count} objects / ${this.replication.deltasSent} deltas`,
+      `  world ${this.world.name}: ${this.world.count} actors / ${this.world.levels.size} levels · ${this.world.ticksDispatched} component ticks`,
       `  subsystems (${this.subsystems.count}): ${subsystemNames.join(', ') || 'none'}`,
       `  modules (${this.modules.count}): ${moduleNames.join(', ') || 'none'}`,
       '',
@@ -767,6 +849,10 @@ export class EngineCore extends EngineObject {
     this.saves?.installConsoleCommands(this.console);
     this.messages?.installConsoleCommands(this.console);
     this.tasks?.installConsoleCommands(this.console);
+    this.diagnostics?.installConsoleCommands(this.console);
+    this.data?.installConsoleCommands(this.console);
+    this.replication?.installConsoleCommands(this.console);
+    this.world?.installConsoleCommands(this.console);
     this.console.registerCommand({
       name: 'engine.subsystems', category: 'Engine', description: 'Lists subsystems and their state.',
       execute: () => engine.subsystems.describe().subsystems
@@ -881,6 +967,26 @@ function isMessageBus(candidate) {
 function isTaskScheduler(candidate) {
   return !!candidate && typeof candidate.submit === 'function' && typeof candidate.drain === 'function'
     && typeof candidate.describe === 'function' && typeof candidate.installConsoleCommands === 'function';
+}
+
+function isDiagnosticHub(candidate) {
+  return !!candidate && typeof candidate.report === 'function' && typeof candidate.clear === 'function'
+    && typeof candidate.installConsoleCommands === 'function';
+}
+
+function isDataRegistry(candidate) {
+  return !!candidate && typeof candidate.define === 'function' && typeof candidate.lookup === 'function'
+    && typeof candidate.installConsoleCommands === 'function';
+}
+
+function isReplicationSystem(candidate) {
+  return !!candidate && typeof candidate.register === 'function' && typeof candidate.collectDeltas === 'function'
+    && typeof candidate.installConsoleCommands === 'function';
+}
+
+function isWorld(candidate) {
+  return !!candidate && typeof candidate.spawnActor === 'function' && typeof candidate.tick === 'function'
+    && typeof candidate.installConsoleCommands === 'function';
 }
 
 export { ModulePhase, moduleEvents, subsystemEvents };

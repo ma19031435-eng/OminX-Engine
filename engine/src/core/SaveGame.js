@@ -33,6 +33,7 @@
 import { MulticastDelegate } from './Delegate.js';
 import { createLogger } from './Logger.js';
 import { ArchiveWriter, ArchiveReader, PayloadKind, defineStruct, getStruct } from './Archive.js';
+import { validateField, isPlainObject } from './Schema.js';
 
 const log = createLogger('Save');
 
@@ -491,7 +492,7 @@ export class SaveSystem {
       if (!isPlainObject(section)) { issues.push(`section \"${name}\" should be an object`); continue; }
       for (const [field, type] of Object.entries(schema.fields)) {
         if (!(field in section)) { issues.push(`${name}.${field} is missing`); continue; }
-        const problem = checkField(type, section[field], `${name}.${field}`);
+        const problem = validateField(type, section[field], `${name}.${field}`);
         if (problem) issues.push(problem);
       }
     }
@@ -797,11 +798,6 @@ export class SaveSystem {
 
 // ------------------------------------------------------------------ helpers
 
-function isPlainObject(value) {
-  return !!value && typeof value === 'object' && !Array.isArray(value)
-    && !(value instanceof Map) && !(value instanceof Set) && !(value instanceof Uint8Array);
-}
-
 function replacer(key, value) {
   if (value instanceof Map) return { __type: 'Map', entries: [...value.entries()] };
   if (value instanceof Set) return { __type: 'Set', values: [...value.values()] };
@@ -830,42 +826,6 @@ export function checksumOf(text) {
     hash = Math.imul(hash, 0x01000193);
   }
   return hash >>> 0;
-}
-
-const INTEGER_RANGES = {
-  u8: [0, 255], u16: [0, 65535], u32: [0, 4294967295],
-  i8: [-128, 127], i16: [-32768, 32767], i32: [-2147483648, 2147483647],
-};
-
-/** Returns a problem string, or `null` when a value matches its declared field type. */
-function checkField(type, value, path) {
-  const spec = String(type ?? '').toLowerCase();
-  if (spec.startsWith('array:')) {
-    if (!Array.isArray(value)) return `${path} should be an array of ${spec.slice(6)}`;
-    for (let i = 0; i < value.length; i++) {
-      const problem = checkField(spec.slice(6), value[i], `${path}[${i}]`);
-      if (problem) return problem;
-    }
-    return null;
-  }
-  if (spec === 'json' || spec === 'any' || spec.startsWith('struct:') || spec.startsWith('enum:')) return null;
-  if (spec === 'vec2' || spec === 'vec3' || spec === 'vec4') {
-    const size = Number(spec.slice(3));
-    if (Array.isArray(value)) return value.length === size ? null : `${path} needs ${size} numbers`;
-    return isPlainObject(value) && ['x', 'y', 'z', 'w'].slice(0, size).every((axis) => Number.isFinite(value[axis]))
-      ? null : `${path} should be a vec${size}`;
-  }
-  if (INTEGER_RANGES[spec]) {
-    const [min, max] = INTEGER_RANGES[spec];
-    if (!Number.isInteger(value)) return `${path} should be an integer (${spec})`;
-    return value >= min && value <= max ? null : `${path} is outside ${spec} [${min}, ${max}]`;
-  }
-  if (spec === 'f32' || spec === 'f64' || spec === 'number' || spec === 'float') {
-    return Number.isFinite(value) ? null : `${path} should be a finite number`;
-  }
-  if (spec === 'string' || spec === 'name' || spec === 'text') return typeof value === 'string' ? null : `${path} should be a string`;
-  if (spec === 'bool' || spec === 'boolean') return typeof value === 'boolean' ? null : `${path} should be a boolean`;
-  return null; // unknown field types are forward-compatible: never reject a save over them
 }
 
 function nowMs() {

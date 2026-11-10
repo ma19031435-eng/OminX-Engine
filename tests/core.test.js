@@ -41,6 +41,14 @@ import {
   delay, retry, parallel, series,
   EngineCore, EnginePhase, createEngine, currentEngine, requireEngine,
   CORE_MODULES, CORE_VERSION, coreModuleList,
+  INTEGER_RANGES, FIELD_TYPES, validateField, coerceField, validateObject, coerceObject,
+  isPlainObject, describeFieldTypes,
+  EngineError, DiagnosticLevel, DiagnosticHub, diagnostics, registerErrorCode, getErrorCode,
+  listErrorCodes, formatMessage, describeError, check, ensure, verify, guard,
+  diagnosticScope,
+  DataTable, DataRegistry, parseCsv, dataEvents,
+  NetRole, NetMode, RpcTarget, NetChannel, ReplicatedObject, ReplicationSystem, replicationEvents,
+  TickGroup, TICK_GROUP_ORDER, ActorLifecycle, worldEvents, ActorComponent, SceneComponent, Actor, World,
 } from '../engine/src/core/index.js';
 
 const DT = 1 / 60;
@@ -1323,7 +1331,10 @@ test('Engine: shutdown tears everything down and can be restarted', async () => 
 test('Core manifest describes every module in the barrel', () => {
   assert.match(CORE_VERSION, /^\d+\.\d+\.\d+$/);
   const modules = coreModuleList();
-  assert.ok(modules.length >= 15);
+  assert.ok(modules.length >= 32);
+  for (const name of ['Schema', 'Diagnostics', 'DataRegistry', 'Replication', 'World']) {
+    assert.ok(CORE_MODULES[name], `the barrel manifest knows about ${name}`);
+  }
   for (const module of modules) {
     assert.ok(typeof module.summary === 'string' && module.summary.length > 10, `${module.name} needs a summary`);
     assert.ok(module.layer >= 1 && module.layer <= 5, `${module.name} needs a layer`);
@@ -2829,5 +2840,502 @@ test('Async: console commands and the engine task service', async () => {
   assert.match(engine.format(), /tasks/);
   const replaced = engine.createTaskScheduler({ name: 'Other', concurrency: 3 });
   assert.equal(replaced.concurrency, 3);
+  await engine.shutdown();
+});
+
+// ---------------------------------------------------------------------- shared field schema
+
+test('Schema: field vocabulary validates primitives, vectors, arrays and unknown types', () => {
+  assert.equal(validateField('u8', 200), null);
+  assert.match(validateField('u8', 300), /outside u8/);
+  assert.match(validateField('i8', 1.5), /integer/);
+  assert.equal(validateField('f32', 0.5), null);
+  assert.match(validateField('f32', Number.NaN), /finite number/);
+  assert.equal(validateField('bool', false), null);
+  assert.match(validateField('bool', 0), /boolean/);
+  assert.equal(validateField('vec3', [1, 2, 3]), null);
+  assert.equal(validateField('vec3', { x: 1, y: 2, z: 3 }), null);
+  assert.match(validateField('vec3', [1, 2]), /needs 3/);
+  assert.equal(validateField('array:u8', [1, 2, 255]), null);
+  assert.match(validateField('array:u8', [1, 999]), /\[1\] is outside u8/);
+  assert.equal(validateField('enum:primary|secondary', 'anything'), null, 'enums are forward compatible');
+  assert.equal(validateField('struct:WeaponRow', { a: 1 }), null);
+  assert.equal(validateField('future:type', Symbol('x')), null, 'unknown types never reject a save');
+  assert.deepEqual(INTEGER_RANGES.u16, [0, 65535]);
+  assert.ok(FIELD_TYPES.includes('array'));
+  assert.equal(isPlainObject({ a: 1 }), true);
+  assert.equal(isPlainObject(new Map()), false);
+  assert.equal(describeFieldTypes().types.length, FIELD_TYPES.length);
+});
+
+test('Schema: coercion parses textual fields and object validation reports every issue', () => {
+  assert.equal(coerceField('u8', ' 24 '), 24);
+  assert.equal(coerceField('f32', '0.125'), 0.125);
+  assert.equal(coerceField('u8', 'nope'), undefined);
+  assert.equal(coerceField('bool', 'yes'), true);
+  assert.equal(coerceField('bool', 'off'), false);
+  assert.equal(coerceField('bool', 'maybe'), undefined);
+  assert.deepEqual(coerceField('vec3', '1,2,3'), [1, 2, 3]);
+  assert.deepEqual(coerceField('array:string', '["primary","sidearm"]'), ['primary', 'sidearm']);
+  assert.deepEqual(coerceField('json', '{"a":1}'), { a: 1 });
+  assert.equal(coerceField('json', 'plain text'), 'plain text');
+
+  const schema = { hp: 'u8', name: 'string' };
+  assert.deepEqual(validateObject(schema, { hp: 10, name: 'Bot' }), []);
+  assert.deepEqual(validateObject(schema, { hp: 10 }), ['name is missing']);
+  assert.deepEqual(validateObject(schema, { hp: 10, name: 'Bot' }, { pathPrefix: 'Row' }), []);
+  assert.match(validateObject(schema, { hp: 999, name: 'Bot' }, { pathPrefix: 'Row' })[0], /Row.hp/);
+  assert.deepEqual(validateObject(schema, { hp: 1, name: 'x', extra: true }, { allowMissing: true, allowExtra: false }), ['extra is not declared']);
+  assert.deepEqual(validateObject(schema, null), ['value should be an object']);
+  const coerced = coerceObject(schema, { hp: '7', name: 'Bot' });
+  assert.deepEqual(coerced.value, { hp: 7, name: 'Bot' });
+  assert.deepEqual(coerced.errors, []);
+  assert.match(coerceObject(schema, { hp: 'abc', name: 'Bot' }).errors[0], /cannot parse/);
+});
+
+// ---------------------------------------------------------------------- diagnostics
+
+test('Diagnostics: assertion levels, codes, fatal handler and bounded deduplication', () => {
+  const hub = new DiagnosticHub({ name: 'TestDiagnostics', capacity: 8 });
+  let fatal = null;
+  hub.setFatalHandler((error) => { fatal = error; });
+  assert.throws(() => hub.checkFailed('invariant broke', { frame: 4 }), (error) => error instanceof EngineError && error.code === 'E_CHECK');
+  assert.equal(fatal.code, 'E_CHECK');
+  assert.equal(fatal.context.frame, 4);
+  assert.deepEqual(describeError(fatal).code, 'E_CHECK');
+  assert.equal(describeError('oops').name, 'ThrownValue');
+
+  for (let i = 0; i < 3; i++) hub.ensureFailed('once per call site');
+  assert.equal(hub.describe().counts.warning, 1, 'a repeated ensure at one call site is deduplicated');
+  assert.equal(hub.suppressed, 2);
+  assert.equal(hub.ensureFailed('always', null, { always: true }), false);
+  assert.equal(hub.describe().counts.warning, 2);
+
+  assert.deepEqual(hub.guard(() => JSON.parse('bad'), { code: 'E_PARSE', fallback: {} }), {});
+  assert.equal(hub.scope('work', () => 42, { budgetMs: 0 }), 42);
+  assert.equal(hub.lastScope.name, 'work');
+  assert.throws(() => hub.guard(() => { throw new Error('rethrow me'); }, { rethrow: true, fallback: 1 }), /rethrow me/);
+
+  registerErrorCode('E_TEST_CUSTOM', { description: 'test code', level: DiagnosticLevel.Warning });
+  assert.equal(getErrorCode('E_TEST_CUSTOM').description, 'test code');
+  assert.ok(listErrorCodes().some((entry) => entry.code === 'E_TEST_CUSTOM'));
+  hub.setMinLevel(DiagnosticLevel.Error);
+  assert.equal(hub.report({ level: DiagnosticLevel.Info, code: 'E_INFO', message: 'filtered' }), null);
+  assert.ok(hub.report({ level: DiagnosticLevel.Error, code: 'E_INFO', message: 'kept' }));
+  assert.equal(hub.clear() > 0, true);
+  assert.equal(hub.describe().total, 0);
+  assert.match(hub.format(), /TestDiagnostics/);
+});
+
+test('Diagnostics: formatMessage, module-level helpers and console commands', () => {
+  assert.equal(formatMessage('x={x} 0={0} {}', { x: 5, 0: 'zero' }), 'x=5 0=zero {}');
+  assert.equal(formatMessage('{0} then {1}', ['a', 'b']), 'a then b');
+  assert.equal(formatMessage('{missing}', {}), '{missing}');
+  assert.equal(check(true, 'ok'), true);
+  assert.throws(() => check(false, 'bad'), (error) => error instanceof EngineError && error.code === 'E_CHECK');
+  assert.equal(verify(true), true);
+  assert.equal(ensure(false, 'once'), false);
+  assert.deepEqual(guard(() => JSON.parse('bad'), { code: 'E_PARSE', fallback: {} }), {});
+  assert.equal(diagnosticScope('scope.work', () => 7), 7);
+
+  const console_ = new Console();
+  const hub = new DiagnosticHub({ name: 'CmdDiagnostics' });
+  hub.installConsoleCommands(console_);
+  assert.match(console_.exec('diag', { silent: true }).output, /CmdDiagnostics/);
+  assert.match(console_.exec('diag.codes', { silent: true }).output, /E_CHECK/);
+  assert.match(console_.exec('diag.throw hello', { silent: true }).output, /E_TEST/);
+  assert.equal(console_.exec('diag.errors', { silent: true }).ok, true);
+  assert.match(console_.exec('diag.level error', { silent: true }).output, /error/);
+  assert.equal(hub.minLevel, DiagnosticLevel.Error);
+  assert.match(console_.exec('diag.clear', { silent: true }).output, /cleared/);
+  assert.ok(diagnostics instanceof DiagnosticHub, 'the module-level helpers share a hub');
+});
+
+// ---------------------------------------------------------------------- data registry
+
+const WEAPON_SCHEMA = Object.freeze({
+  name: 'string', damage: 'u8', rpm: 'u16', spread: 'f32', tags: 'array:string',
+});
+
+test('DataRegistry: typed rows, validation, query, diff and CSV round-trip', () => {
+  const registry = new DataRegistry({ name: 'GameData' });
+  const table = registry.define('Weapons', WEAPON_SCHEMA, { keyField: 'id' });
+  assert.ok(table instanceof DataTable);
+  assert.equal(table.add('rifle', { name: 'Rifle', damage: 24, rpm: 600, spread: 0.02, tags: ['primary'] }).id, 'rifle');
+  assert.ok(table.add('pistol', { name: 'Pistol', damage: 18, rpm: 300, spread: 0.05, tags: ['sidearm'] }));
+  assert.equal(table.add('bad', { name: 'Bad', damage: 999, rpm: 1, spread: 0, tags: [] }), null, 'u8 overflow is rejected');
+  assert.ok(table.lastErrors.length);
+  assert.equal(table.count, 2);
+  assert.equal(registry.lookup('Weapons', 'rifle').damage, 24);
+  assert.equal(registry.query('Weapons', { where: { rpm: 300 } }).length, 1);
+  assert.deepEqual(table.query({ sort: { field: 'damage', descending: true } }).map((row) => row.id), ['rifle', 'pistol']);
+  assert.deepEqual(table.query({ where: (row) => row.damage > 20, limit: 1 }).map((row) => row.id), ['rifle']);
+  assert.ok(table.find((row) => row.name === 'Pistol'));
+  assert.deepEqual(table.validate(), []);
+  assert.deepEqual(registry.validate(), { total: 0, byTable: {} });
+
+  const copy = table.clone('Copy');
+  assert.deepEqual(copy.diff(table), { added: [], removed: [], changed: [] });
+  copy.add('smg', { name: 'SMG', damage: 14, rpm: 900, spread: 0.08, tags: ['primary'] });
+  assert.deepEqual(copy.diff(table).added, ['smg']);
+  assert.equal(copy.remove('smg'), true);
+
+  const csv = table.toCsv();
+  assert.match(csv, /^id,name,damage,rpm,spread,tags/);
+  const restored = new DataRegistry();
+  assert.deepEqual(restored.loadFromText('Weapons', csv, { format: 'csv', schema: WEAPON_SCHEMA, keyField: 'id' }), { loaded: 2, errors: [] });
+  assert.equal(restored.lookup('Weapons', 'rifle').damage, 24);
+  assert.deepEqual(restored.lookup('Weapons', 'pistol').tags, ['sidearm']);
+  assert.deepEqual(restored.validate(), { total: 0, byTable: {} });
+
+  assert.deepEqual(parseCsv('a,b\n"x,y","he said ""hi"""\n'), [['a', 'b'], ['x,y', 'he said "hi"']]);
+  assert.deepEqual(parseCsv('# comment\nid,name\n1,One\n'), [['id', 'name'], ['1', 'One']]);
+});
+
+test('DataRegistry: JSON export/import, async sources and console reachability', async () => {
+  const registry = new DataRegistry({ name: 'GameData' });
+  const table = registry.define('Weapons', WEAPON_SCHEMA, { keyField: 'id' });
+  table.add('rifle', { name: 'Rifle', damage: 24, rpm: 600, spread: 0.02, tags: ['primary'] });
+  const exported = registry.exportAll();
+  assert.match(exported, /ominx-data/);
+  const imported = new DataRegistry();
+  assert.equal(imported.importAll(exported), 1);
+  assert.equal(imported.lookup('Weapons', 'rifle').name, 'Rifle');
+  assert.equal(imported.importAll('{"format":"other"}'), 0);
+  assert.equal(imported.describe().rows, 1);
+  assert.match(imported.format(), /1 rows/);
+
+  let loaded = 0;
+  const lazy = new DataRegistry();
+  lazy.registerSource('Weapons', {
+    format: 'csv', schema: WEAPON_SCHEMA, keyField: 'id',
+    loader: async () => { loaded++; return table.toCsv(); },
+  });
+  const results = await lazy.loadAll();
+  assert.equal(loaded, 1);
+  assert.equal(results[0].table.count, 1);
+  assert.equal(lazy.lookup('Weapons', 'rifle').damage, 24);
+  assert.equal(lazy.loadedCount, 1);
+  assert.equal(await lazy.load('Missing'), null);
+
+  const console_ = new Console();
+  registry.installConsoleCommands(console_);
+  assert.match(console_.exec('data', { silent: true }).output, /GameData/);
+  assert.match(console_.exec('data.get Weapons rifle', { silent: true }).output, /Rifle/);
+  assert.match(console_.exec('data.query Weapons rpm=600', { silent: true }).output, /rifle/);
+  assert.match(console_.exec('data.csv Weapons', { silent: true }).output, /^id,name/);
+  assert.match(console_.exec('data.validate', { silent: true }).output, /valid/);
+  assert.equal(console_.exec('data.get Missing', { silent: true }).ok, true);
+  assert.ok(dataEvents.onLoaded instanceof Object);
+});
+
+// ---------------------------------------------------------------------- replication
+
+test('Replication: role-aware deltas, stale detection, conflicts and snapshots', () => {
+  const server = new ReplicationSystem({ mode: NetMode.Server, localRole: NetRole.Authority });
+  const actor = server.register(7, { classId: 'Player', role: NetRole.Authority, properties: { health: 100, team: 'red' } });
+  assert.ok(actor instanceof ReplicatedObject);
+  assert.equal(actor.isAuthority, true);
+  assert.equal(server.setProperty(7, 'health', 82), true);
+  assert.equal(server.setProperty(7, 'team', 'red'), false, 'an unchanged property stays clean');
+  assert.equal(actor.dirtyCount, 1);
+  const deltas = server.collectDeltas();
+  assert.equal(deltas.length, 1);
+  assert.deepEqual(deltas[0].properties, { health: 82 });
+  assert.equal(server.collectDeltas().length, 0, 'dirty flags are cleared after one flush');
+
+  const client = new ReplicationSystem({ mode: NetMode.Client, localRole: NetRole.SimulatedProxy });
+  const report = client.applyDeltas(deltas);
+  assert.equal(report.created, 1);
+  assert.equal(report.applied, 1);
+  assert.equal(client.get(7).role, NetRole.SimulatedProxy);
+  assert.equal(client.get(7).snapshot().health, 82);
+  assert.equal(client.applyDeltas(deltas).stale, 1, 'a repeated delta is stale');
+
+  const authority = new ReplicationSystem({ mode: NetMode.Server, localRole: NetRole.Authority });
+  authority.register(7, { role: NetRole.Authority, properties: { health: 100 } });
+  assert.equal(authority.applyDeltas(deltas).conflicts, 1, 'local authority refuses a remote delta');
+  assert.equal(authority.get(7).snapshot().health, 100);
+
+  const snapshot = server.snapshot();
+  assert.equal(snapshot.format, 'ominx-replication');
+  const lateJoin = new ReplicationSystem();
+  assert.equal(lateJoin.loadSnapshot(JSON.stringify(snapshot)), 1);
+  assert.equal(lateJoin.get(7).snapshot().team, 'red');
+  assert.throws(() => lateJoin.loadSnapshot('{"format":"other"}'), /not an OminX/);
+
+  server.setRelevancyFilter((object, viewer) => object.netId === viewer?.id);
+  server.setProperty(7, 'health', 50);
+  assert.equal(server.collectDeltas({ viewer: { id: 99 } }).length, 0, 'irrelevant objects stay dormant');
+  assert.equal(server.collectDeltas({ viewer: { id: 7 } }).length, 1, 'the dirty property survives until relevant');
+  assert.match(server.format(), /authority/);
+  assert.equal(server.describe().objects, 1);
+  assert.ok(replicationEvents.onDelta instanceof Object);
+});
+
+test('Replication: ordered reliable channels and bounded resend windows', () => {
+  const channel = new NetChannel({ name: 'state', capacity: 4 });
+  const a = channel.send({ x: 1 });
+  const b = channel.send({ x: 2 });
+  const c = channel.send({ x: 3 });
+  assert.equal(channel.receive(c).length, 0, 'a gap is held');
+  assert.equal(channel.gapCount, 1);
+  assert.equal(channel.receive(b).length, 0);
+  assert.deepEqual(channel.receive(a).map((record) => record.payload.x), [1, 2, 3], 'delivered in send order');
+  assert.equal(channel.receive(a).length, 0);
+  assert.equal(channel.duplicates, 1);
+  assert.equal(channel.ack(3), 3);
+  assert.equal(channel.unacknowledged().length, 0);
+  assert.equal(channel.describe().delivered, 3);
+
+  const lossy = new NetChannel({ name: 'effects', reliable: false });
+  assert.deepEqual(lossy.receive(lossy.send({ fx: 'tracer' })).map((record) => record.payload.fx), ['tracer']);
+  assert.equal(lossy.pending.length, 0, 'unreliable records are not retained');
+
+  for (let i = 0; i < 8; i++) channel.send({ i });
+  assert.equal(channel.dropped, 4, 'capacity drops the oldest pending records');
+  assert.ok(channel.lastError);
+});
+
+test('Replication: RPC dispatch, error isolation and console commands', () => {
+  const net = new ReplicationSystem({ name: 'RpcNet' });
+  net.register(7, { classId: 'Player', properties: { health: 100 } });
+  const received = [];
+  const handle = net.onRpc(7, 'fire', (args) => received.push(args));
+  const rpc = net.queueRpc(7, 'fire', { weapon: 'rifle' }, { target: RpcTarget.All });
+  assert.equal(rpc.target, RpcTarget.All);
+  assert.equal(net.drainRpcs().length, 1);
+  assert.equal(net.drainRpcs().length, 0);
+  assert.equal(net.receiveRpc(rpc).handled, 1);
+  assert.deepEqual(received, [{ weapon: 'rifle' }]);
+  assert.equal(handle.unbind(), true);
+  assert.equal(net.receiveRpc(rpc).handled, 0);
+  assert.equal(net.unhandledRpcs, 1);
+
+  net.onRpc(7, 'boom', () => { throw new Error('bad handler'); });
+  net.onRpc(7, 'boom', () => received.push('ok'));
+  const result = net.receiveRpc(net.queueRpc(7, 'boom', {}));
+  assert.equal(result.handled, 1, 'one throwing handler does not block the next');
+  assert.equal(net.errors.length, 1);
+  assert.equal(received[received.length - 1], 'ok');
+
+  const console_ = new Console();
+  net.installConsoleCommands(console_);
+  assert.match(console_.exec('net', { silent: true }).output, /RpcNet/);
+  assert.match(console_.exec('net.actors', { silent: true }).output, /netId/);
+  assert.match(console_.exec('net.channels', { silent: true }).output, /state/);
+  assert.match(console_.exec('net.tick 3', { silent: true }).output, /net tick 3/);
+  assert.equal(net.tickCount, 3);
+});
+
+// ---------------------------------------------------------------------- engine wiring
+
+test('Engine: diagnostics, data tables and replication are boot-wired to the frame and console', async () => {
+  const engine = await createEngine({ name: 'NetEngine', target: 'client', netMode: NetMode.Server, netRole: NetRole.Authority });
+  assert.ok(engine.diagnostics instanceof DiagnosticHub);
+  assert.ok(engine.data instanceof DataRegistry);
+  assert.ok(engine.replication instanceof ReplicationSystem);
+  for (const command of ['diag', 'diag.codes', 'diag.errors', 'data', 'data.get', 'data.validate', 'net', 'net.actors', 'net.channels', 'net.set', 'net.flush']) {
+    assert.equal(engine.console.hasCommand(command), true, `${command} must be reachable`);
+  }
+
+  engine.data.define('Weapons', WEAPON_SCHEMA, { keyField: 'id' });
+  engine.data.get('Weapons').add('rifle', { name: 'Rifle', damage: 24, rpm: 600, spread: 0.02, tags: [] });
+  engine.replication.register(1, { classId: 'Bot', role: NetRole.Authority, properties: { hp: 10 } });
+  engine.replication.setProperty(1, 'hp', 9);
+  engine.frame(DT);
+  assert.equal(engine.replication.tickCount, 1, 'replication ticks on the fixed simulation clock');
+  assert.equal(engine.describe().data.tables, 1);
+  assert.equal(engine.describe().data.rows, 1);
+  assert.equal(engine.describe().replication.objects, 1);
+  assert.match(engine.format(), /data 1 tables/);
+  assert.match(engine.format(), /net 1 objects/);
+  assert.match(engine.console.exec('data.validate', { silent: true }).output, /valid/);
+  assert.match(engine.console.exec('net.flush', { silent: true }).output, /hp/);
+
+  const replaced = engine.createReplicationSystem({ name: 'OtherNet', mode: NetMode.Client });
+  assert.equal(replaced.name, 'OtherNet');
+  assert.equal(engine.replication, replaced);
+  const data = engine.createDataRegistry({ name: 'OtherData' });
+  assert.equal(data.name, 'OtherData');
+  await engine.shutdown();
+});
+
+// ---------------------------------------------------------------------- world / actors / components
+
+function near(actual, expected, tolerance = 1e-6) {
+  for (let i = 0; i < expected.length; i++) assert.ok(Math.abs(actual[i] - expected[i]) <= tolerance, `${actual[i]} ≈ ${expected[i]}`);
+}
+
+test('World: actor lifecycle, components, tick groups and isolated errors', () => {
+  const world = new World({ name: 'LifecycleWorld' });
+  const events = [];
+  const actor = world.spawnActor({ name: 'Actor1', className: 'TestActor' });
+  assert.ok(actor instanceof Actor);
+  assert.equal(actor.state, ActorLifecycle.Playing, 'spawning into a running world begins play');
+  assert.equal(actor.components.length, 1, 'an actor always has a root scene component');
+  assert.ok(actor.root instanceof SceneComponent);
+  assert.deepEqual(TICK_GROUP_ORDER, [TickGroup.PrePhysics, TickGroup.DuringPhysics, TickGroup.PostPhysics, TickGroup.PostUpdateWork]);
+
+  const order = [];
+  const pre = actor.addComponent(new ActorComponent({
+    name: 'pre', tickGroup: TickGroup.PrePhysics, tickEnabled: true,
+    hooks: { onBeginPlay: () => events.push('begin'), onEndPlay: () => events.push('end'), onTick: () => order.push('pre') },
+  }));
+  pre.beginPlay();
+  actor.addComponent(new ActorComponent({ name: 'post', tickGroup: TickGroup.PostUpdateWork, tickEnabled: true, hooks: { onTick: () => order.push('post') } }));
+  const boom = actor.addComponent(new ActorComponent({
+    name: 'boom', tickGroup: TickGroup.DuringPhysics, tickEnabled: true,
+    hooks: { onTick: () => { throw new Error('bad tick'); } },
+  }));
+  const slow = actor.addComponent(new ActorComponent({ name: 'slow', tickEnabled: true, tickInterval: 0.05, hooks: { onTick: () => order.push('slow') } }));
+
+  world.tick(DT);
+  assert.deepEqual(order, ['pre', 'post'], 'tick groups dispatch in order');
+  assert.equal(boom.lastError, 'bad tick', 'a throwing component records its own error');
+  assert.equal(world.errors.length, 0, 'a bad component does not fail the world');
+  assert.equal(world.ticksDispatched, 3);
+  world.runFixedFrames(2, DT);
+  assert.equal(slow.tickCount, 1, 'a tick interval accumulates across fixed steps');
+  assert.ok(events.includes('begin'));
+
+  assert.equal(actor.getComponent('post').name, 'post');
+  assert.equal(actor.getComponent(ActorComponent), actor.root, 'the root scene component is an ActorComponent');
+  assert.equal(actor.removeComponent(boom), true);
+  assert.equal(actor.components.includes(boom), false);
+  assert.equal(actor.tickGroup(TickGroup.DuringPhysics, DT), 0);
+
+  worldEvents.onActorSpawned.broadcast(actor, world);
+  assert.equal(world.endPlay(), world);
+  assert.equal(actor.endPlay(), actor);
+  assert.equal(world.beginPlay(), world);
+  assert.equal(actor.state, ActorLifecycle.EndedPlay, 'beginPlay() does not resurrect an ended actor');
+  assert.ok(worldEvents.onTickGroup instanceof Object);
+});
+
+test('World: scene component hierarchy composes transforms and keepWorld attachment preserves placement', () => {
+  const world = new World({ name: 'HierarchyWorld' });
+  const parent = world.spawnActor({ name: 'Parent' });
+  parent.setPosition(0, 2, -10);
+  const child = new SceneComponent({ name: 'Child' });
+  child.setPosition(0, 0, -1);
+  assert.equal(child.attachTo(parent.root), true);
+  near(child.getWorldPosition().toJSON(), [0, 2, -11]);
+  assert.equal(parent.root.children.length, 1);
+  assert.equal(child.descendants().length, 0);
+
+  const grandchild = new SceneComponent({ name: 'Grandchild' });
+  grandchild.setPosition(1, 0, 0);
+  grandchild.attachTo(child);
+  near(grandchild.getWorldPosition().toJSON(), [1, 2, -11]);
+  assert.equal(parent.root.descendants().length, 2);
+  assert.throws(() => child.attachTo(grandchild), /cycle/);
+
+  const beforeRotation = grandchild.getWorldPosition().toJSON();
+  parent.root.rotateY(90);
+  const rotated = grandchild.getWorldPosition().toJSON();
+  assert.ok(rotated.some((value, index) => Math.abs(value - beforeRotation[index]) > 0.1), 'a parent rotation moves attached children');
+
+  const before = grandchild.getWorldPosition().toJSON();
+  const newParent = world.spawnActor({ name: 'NewParent' });
+  newParent.setPosition(10, 5, 0);
+  assert.equal(grandchild.attachTo(newParent.root, { keepWorld: true }), true);
+  near(grandchild.getWorldPosition().toJSON(), before);
+  assert.equal(newParent.root.children.length, 1);
+  assert.equal(child.children.length, 0);
+  assert.equal(grandchild.detach(), true);
+  assert.equal(grandchild.detach(), false);
+  assert.match(child.describe().worldPosition.length + '', /3/);
+});
+
+test('World: queries, tags, levels, lifespan and actor destruction', () => {
+  const world = new World({ name: 'QueryWorld' });
+  const red = world.spawnActor({ name: 'RedSpawn', className: 'PlayerStart', tags: ['spawn', 'red'] }, { level: 'Arena' });
+  world.spawnActor({ name: 'BlueSpawn', className: 'PlayerStart', tags: ['spawn', 'blue'] }, { level: 'Arena' });
+  world.spawnActor({ name: 'Crate', className: 'Prop' }, { level: 'Props' });
+  assert.equal(world.count, 3);
+  assert.equal(world.actorsWithTag('spawn').length, 2);
+  assert.equal(world.actorsOfClass('PlayerStart').length, 2);
+  assert.equal(world.findActor('RedSpawn'), red);
+  assert.equal(red.addTag('team'), red);
+  assert.equal(red.hasTag('team'), true);
+  assert.equal(red.removeTag('team'), true);
+  assert.equal(world.levels.get('Arena').actors.size, 2);
+  assert.equal(world.loadLevel('Arena').name, 'Arena');
+  assert.equal(world.unloadLevel('Arena'), 2);
+  assert.equal(world.count, 1);
+
+  const temp = world.spawnActor({ name: 'Temp', lifespan: 0.05 });
+  world.runFixedFrames(4, 0.02);
+  assert.equal(temp.isDestroyed, true, 'a lifespan expires after the elapsed time');
+  assert.equal(world.destroyActor(temp), false, 'destroying twice is a no-op');
+  const doomed = world.spawnActor({ name: 'Doomed' });
+  assert.equal(doomed.destroy(), true);
+  assert.equal(doomed.state, ActorLifecycle.Destroyed);
+  assert.equal(world.describe().destroyed, 4);
+  assert.match(world.format(), /QueryWorld/);
+});
+
+test('World: replication binding, net deltas and portable snapshots', () => {
+  const net = new ReplicationSystem({ mode: NetMode.Server, localRole: NetRole.Authority });
+  const world = new World({ name: 'ArenaWorld', replication: net });
+  const actor = world.spawnActor({ name: 'Player', className: 'Player', tags: ['local'] }, {
+    replicate: true, properties: { health: 100 },
+  });
+  assert.equal(actor.netId, 1);
+  assert.equal(net.has(1), true);
+  assert.equal(actor.getReplicated('health'), 100);
+  actor.setPosition(3, 1, -4);
+  actor.setReplicated('health', 82);
+  const deltas = world.collectNetDeltas();
+  assert.equal(deltas.length, 1);
+  assert.deepEqual(deltas[0].properties, { health: 82 });
+
+  const snapshot = world.snapshot();
+  assert.equal(snapshot.format, 'ominx-world');
+  assert.equal(snapshot.actors.length, 1);
+  const restored = new World({ name: 'Restored', replication: new ReplicationSystem() });
+  assert.equal(restored.loadSnapshot(JSON.stringify(snapshot)), 1);
+  const copy = restored.findActor('Player');
+  assert.equal(copy.getReplicated('health'), 82);
+  near(copy.getWorldPosition().toJSON(), [3, 1, -4]);
+  assert.equal(copy.hasTag('local'), true);
+  assert.throws(() => restored.loadSnapshot('{"format":"other"}'), /not an OminX/);
+
+  assert.equal(world.destroyActor(actor), true);
+  assert.equal(net.has(1), false, 'destroying an actor unregisters its replicated object');
+  assert.equal(world.bindReplication(null).replication, null);
+});
+
+test('World: console commands and the engine world service', async () => {
+  const console_ = new Console();
+  const world = new World({ name: 'CmdWorld' });
+  world.installConsoleCommands(console_);
+  assert.match(console_.exec('world', { silent: true }).output, /CmdWorld/);
+  assert.match(console_.exec('world.spawn Test Bot', { silent: true }).output, /spawned/);
+  assert.equal(world.count, 1);
+  assert.match(console_.exec('world.actors', { silent: true }).output, /actorId/);
+  assert.match(console_.exec('world.levels', { silent: true }).output, /PersistentLevel/);
+  assert.match(console_.exec('world.tick 3', { silent: true }).output, /world tick 3/);
+  assert.match(console_.exec('world.net', { silent: true }).output, /\[\]/);
+  assert.equal(console_.exec('world.destroy 999', { silent: true }).ok, true);
+
+  const engine = await createEngine({ name: 'WorldEngine', target: 'client' });
+  assert.ok(engine.world instanceof World);
+  for (const command of ['world', 'world.actors', 'world.spawn', 'world.destroy', 'world.levels', 'world.tick', 'world.net']) {
+    assert.equal(engine.console.hasCommand(command), true, `${command} must be reachable`);
+  }
+  const actor = engine.world.spawnActor({ name: 'Bot', className: 'Bot' }, { replicate: true });
+  actor.addComponent(new ActorComponent({ name: 'think', tickEnabled: true, hooks: { onTick: () => {} } }));
+  engine.frame(DT);
+  assert.equal(engine.world.tickCount, 1, 'the world ticks on the fixed simulation step');
+  assert.equal(engine.describe().world.actors, 1);
+  assert.equal(engine.describe().world.errors, 0);
+  assert.match(engine.format(), /world OminXWorld/);
+  actor.setReplicated('alive', true);
+  assert.equal(engine.console.exec('world.net', { silent: true }).ok, true);
+  const replaced = engine.createWorld({ name: 'OtherWorld' });
+  assert.equal(replaced.name, 'OtherWorld');
+  assert.equal(engine.world, replaced);
   await engine.shutdown();
 });

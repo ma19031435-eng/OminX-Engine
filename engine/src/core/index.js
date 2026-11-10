@@ -5,11 +5,11 @@
  *
  * The core is layered, lowest first — nothing below depends on anything above:
  *
- *   1. **Foundations** — `Delegate`, `Signal`, `Logger`, `Containers`, `Stats`, `Trace`, `Memory`
+ *   1. **Foundations** — `Delegate`, `Signal`, `Logger`, `Containers`, `Stats`, `Trace`, `Memory`, `Schema`, `Diagnostics`
  *   2. **Object model** — `Object` (reflection, ids, tags, lifetimes), `GarbageCollector`
- *   3. **Services** — `Config`, `Console`, `AssetRegistry`, `Localization`, `JobGraph`, `TimerManager`, `Curve`, `EventBus`, `Async`
+ *   3. **Services** — `Config`, `Console`, `AssetRegistry`, `Localization`, `JobGraph`, `TimerManager`, `Curve`, `EventBus`, `Async`, `DataRegistry`
  *   4. **Composition** — `Subsystem`, `ModuleManager`, `Plugin`
- *   5. **Runtime** — `EngineCore` (one clock over `Scheduler`), `InputMapping`, `Archive`, `Replay`, `SaveGame`
+ *   5. **Runtime** — `EngineCore` (one clock over `Scheduler`), `InputMapping`, `Archive`, `Replay`, `SaveGame`, `Replication`, `World`
  *
  * `CORE_MODULES` is the machine-readable version of that list: it is what `engine/core-report`
  * prints, what a documentation test asserts has a header comment, and what a plugin's
@@ -18,9 +18,19 @@
  * @module engine/src/core
  */
 
-export const CORE_VERSION = '0.3.0';
+export const CORE_VERSION = '0.4.0';
 
 // ------------------------------------------------------------------ foundations
+export {
+  INTEGER_RANGES, FIELD_TYPES, validateField, coerceField, validateObject, coerceObject,
+  isPlainObject, describeFieldTypes,
+} from './Schema.js';
+export {
+  EngineError, DiagnosticLevel, diagnosticEvents, DiagnosticHub, diagnostics,
+  registerErrorCode, getErrorCode, listErrorCodes, formatMessage, describeError,
+  check, checkf, ensure, ensureAlways, verify, fatal, assertNever,
+  warn as diagnosticWarn, error as diagnosticError, guard, guardAsync, scope as diagnosticScope,
+} from './Diagnostics.js';
 export {
   Delegate, MulticastDelegate, DelegateHandle, bindToDelegate, setDelegateErrorHandler,
 } from './Delegate.js';
@@ -86,6 +96,9 @@ export {
   CancellationToken, CancellationError, WorkerPool, asyncEvents,
   delay, retry, parallel, series,
 } from './Async.js';
+export {
+  DataTable, DataRegistry, dataEvents, parseCsv,
+} from './DataRegistry.js';
 
 // ------------------------------------------------------------------ composition
 export {
@@ -116,12 +129,20 @@ export {
 export {
   SaveGame, SaveSystem, SaveStorage, SaveSlotHeader, saveEvents, checksumOf, reviveSavedValue,
 } from './SaveGame.js';
+export {
+  NetRole, NetMode, RpcTarget, replicationEvents, NetChannel, ReplicatedObject, ReplicationSystem,
+} from './Replication.js';
+export {
+  TickGroup, TICK_GROUP_ORDER, ActorLifecycle, worldEvents, ActorComponent, SceneComponent, Actor, World,
+} from './World.js';
 
 /**
  * The core manifest: module → { layer, summary }. Kept next to the exports on purpose — a module
  * that is exported here says what it is for, and a test asserts every file in `core/` appears.
  */
 export const CORE_MODULES = Object.freeze({
+  Schema: { layer: 1, summary: 'Shared reflected field vocabulary: integer widths, vectors, enums, arrays, structs, validation and coercion.' },
+  Diagnostics: { layer: 1, summary: 'UE-style check/ensure/verify, error codes, bounded deduplicated reports and fatal handling.' },
   Logger: { layer: 1, summary: 'Levelled, channelled logging with a bounded buffer and an event stream.' },
   Delegate: { layer: 1, summary: 'Single-cast and multicast delegates with weak owners and priorities.' },
   Signal: { layer: 1, summary: 'Roblox-style signals: connect/emit/await with error isolation.' },
@@ -140,6 +161,7 @@ export const CORE_MODULES = Object.freeze({
   Localization: { layer: 3, summary: 'Cultures with fallback, string tables, plurals, culture-aware formatting.' },
   JobGraph: { layer: 3, summary: 'Dependency-ordered frame jobs with levels, budgets and failure isolation.' },
   EventBus: { layer: 3, summary: 'Deterministic event queue and topic message bus with request/reply and TTLs.' },
+  DataRegistry: { layer: 3, summary: 'Schema-validated data tables with CSV/JSON I/O, diff, query and asset-backed loading.' },
   Async: { layer: 3, summary: 'Priority task scheduler, cancellation, async scopes and a bounded worker pool.' },
   Subsystem: { layer: 4, summary: 'Dependency-ordered engine subsystems with lifecycle and frame dispatch.' },
   ModuleManager: { layer: 4, summary: 'Boot-phase modules, target gating, dependency order, hot reload.' },
@@ -148,6 +170,8 @@ export const CORE_MODULES = Object.freeze({
   EngineCore: { layer: 5, summary: 'The engine object: one clock, all services, explicit lifecycle.' },
   InputMapping: { layer: 5, summary: 'Enhanced-Input-style actions, contexts, modifiers and triggers.' },
   Archive: { layer: 5, summary: 'Versioned, sectioned binary/JSON serialization with migration and lazy reads.' },
+  World: { layer: 5, summary: 'UE-style world, actors, scene components, tick groups, levels, lifecycle and replication binding.' },
+  Replication: { layer: 5, summary: 'Role-aware actor/property deltas, ordered reliable channels, RPCs, relevancy and snapshots.' },
   SaveGame: { layer: 5, summary: 'Atomic saved-game slots: checksums, backups, migrations, autosave and rotation.' },
 });
 

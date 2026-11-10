@@ -16,6 +16,7 @@ import {
   createEngine, Subsystem, ModulePhase, PluginTarget, Keys, createShooterContext,
   ConfigLayer, parseCommandLine, CORE_VERSION, coreModuleList, LOCTEXT, defineStruct,
   ArchiveWriter, ArchiveReader, PayloadKind, ARCHIVE_VERSION, SaveStorage,
+  NetMode, NetRole, engineCoreEvents, TickGroup, ActorComponent,
 } from '../engine/src/core/index.js';
 import { setLogLevel } from '../engine/src/core/Logger.js';
 
@@ -87,6 +88,7 @@ async function main() {
     version: CORE_VERSION,
     target: PluginTarget.Client,
     tickRate: 60,
+    netMode: NetMode.ListenServer, netRole: NetRole.Authority,
     tracing: options.tracing,
     culture: process.env.OMINX_CULTURE ?? 'en',
     argv: process.argv.slice(2),
@@ -206,6 +208,44 @@ async function main() {
     collect: () => ({ progress: { level: 4, bots: options.bots, tick: engine.tickCount } }),
   });
 
+  // --- typed data tables: one shared field vocabulary is used for saves, CSV and archives
+  engine.data.define('Weapons', {
+    name: 'string', damage: 'u8', rpm: 'u16', spread: 'f32', tags: 'array:string',
+  }, { keyField: 'id' });
+  const weaponTable = engine.data.get('Weapons');
+  weaponTable.add('rifle', { name: 'Rifle', damage: 24, rpm: 600, spread: 0.02, tags: ['primary', 'hitscan'] });
+  weaponTable.add('pistol', { name: 'Pistol', damage: 18, rpm: 300, spread: 0.05, tags: ['sidearm'] });
+  const dataValidation = engine.data.validate();
+
+  // --- diagnostics: an info record proves the hub is bounded, queryable and console-reachable
+  engine.diagnostics.report({ level: 'info', code: 'E_REPORT', message: 'core report boot completed' });
+
+  // --- replication: a few networked actors, driven by the fixed-step delegate
+  engine.replication.register(1, { classId: 'Player', role: NetRole.Authority, properties: { health: 100, kills: 0 } });
+  engine.replication.register(2, { classId: 'Pickup', role: NetRole.Authority, properties: { active: true } });
+  const netDeltas = [];
+  const rpcLog = [];
+  engine.replication.onRpc(1, 'report.ping', (args) => rpcLog.push(args));
+  const worldActor = engine.world.spawnActor({
+    name: 'ReportActor', className: 'ReportActor', tags: ['report'],
+  }, { level: 'ReportLevel', replicate: true, properties: { health: 100 } });
+  worldActor.setPosition(0, 1, -5);
+  let worldTicks = 0;
+  worldActor.addComponent(new ActorComponent({
+    name: 'report.tick', tickGroup: TickGroup.PrePhysics, tickEnabled: true,
+    hooks: { onTick: () => { worldTicks++; } },
+  }));
+
+  const netConnection = engineCoreEvents.onFixedStep.connect((host, { tick }) => {
+    if (tick % 60 !== 0) return;
+    host.replication.setProperty(1, 'kills', tick / 60);
+    netDeltas.push(...host.replication.collectDeltas());
+    const rpc = host.replication.queueRpc(1, 'report.ping', { tick });
+    host.replication.receiveRpc(rpc);
+    host.replication.drainRpcs();
+    worldActor.setReplicated('health', 100 - Math.round(tick / 60));
+  });
+
   // --- run frames
   const started = performance.now();
   engine.runFixedFrames(options.frames, 1 / 60);
@@ -214,6 +254,7 @@ async function main() {
   const saveRows = engine.saves.list();
   const requestedStats = await statsRequest.promise;
   const asyncTaskValue = await asyncTask.promise;
+  netConnection.disconnect();
 
   // --- report
   const report = {
@@ -259,6 +300,27 @@ async function main() {
       running: engine.tasks.runningCount, concurrency: engine.tasks.concurrency,
       order: taskOrder, asyncResult: asyncTaskValue,
     },
+    diagnostics: {
+      reports: engine.diagnostics.total, suppressed: engine.diagnostics.suppressed,
+      byLevel: { ...engine.diagnostics.counts }, minLevel: engine.diagnostics.minLevel,
+    },
+    data: {
+      tables: engine.data.count, rows: weaponTable.count,
+      validationIssues: dataValidation.total, csvColumns: weaponTable.columns.length,
+      sample: engine.data.lookup('Weapons', 'rifle'),
+    },
+    replication: {
+      objects: engine.replication.count, tick: engine.replication.tickCount,
+      deltas: netDeltas.length, rpcs: rpcLog.length, stale: engine.replication.staleCount,
+      conflicts: engine.replication.conflictCount, errors: engine.replication.errors.length,
+      channels: engine.replication.describe().channels.map((channel) => ({ name: channel.name, sent: channel.sent, dropped: channel.dropped })),
+    },
+    world: {
+      actors: engine.world.count, levels: engine.world.levels.size,
+      tick: engine.world.tickCount, componentTicks: worldTicks,
+      errors: engine.world.errors.length, spawned: engine.world.spawnCount,
+      snapshotActors: engine.world.snapshot().actors.length,
+    },
     objects: { live: engine.lastFrameRecord().objects.live, classes: engine.lastFrameRecord().objects.classes },
     collector: engine.collector.stats(),
     input: { contexts: input.contextNames(), move: input.getActionVector('Move'), fire: input.isActionActive('Fire') },
@@ -266,7 +328,7 @@ async function main() {
     trace: engine.trace.enabled ? { events: engine.trace.eventCount, top: engine.trace.top(5) } : { enabled: false },
     config: { mode: engine.config.getString('game.mode'), bots: engine.config.getNumber('game.botCount'), fov: engine.config.getNumber('renderer.fov'), origin: engine.config.origin('renderer.fov')?.layer },
     console: { commands: engine.console.commandsList().length, variables: engine.console.variableNames().length },
-    errors: { modules: engine.modules.errors.length, subsystems: engine.subsystems.errors.length, plugins: engine.plugins.errors.length, jobs: engine.jobs.errors.length, saves: saveVerification.corrupt.length, messages: engine.messages.errors.length, tasks: engine.tasks.failed },
+    errors: { modules: engine.modules.errors.length, subsystems: engine.subsystems.errors.length, plugins: engine.plugins.errors.length, jobs: engine.jobs.errors.length, saves: saveVerification.corrupt.length, messages: engine.messages.errors.length, tasks: engine.tasks.failed, diagnostics: engine.diagnostics.counts.fatal, data: dataValidation.total, replication: engine.replication.errors.length, world: engine.world.errors.length },
   };
 
   if (options.json) {
@@ -286,6 +348,10 @@ async function main() {
     console.log(`  saves           ${report.saves.checked} slots (${report.saves.verified} verified, ${report.saves.corrupt} corrupt) · ${report.saves.writes} writes · ${report.saves.autosaves} autosaves · ${report.saves.format}`);
     console.log(`  messages        ${report.messages.published} published · ${report.messages.delivered} delivered · ${report.messages.replies} replies · ${report.messages.pending} pending · request ${JSON.stringify(report.messages.request)}`);
     console.log(`  tasks           ${report.tasks.completed}/${report.tasks.submitted} completed · ${report.tasks.failed} failed · ${report.tasks.running} running · concurrency ${report.tasks.concurrency} · order [${report.tasks.order.join(', ')}]`);
+    console.log(`  diagnostics     ${report.diagnostics.reports} reports · ${report.diagnostics.suppressed} deduplicated · ${report.diagnostics.byLevel.fatal} fatal`);
+    console.log(`  data            ${report.data.tables} tables / ${report.data.rows} rows · ${report.data.validationIssues} validation issues · ${report.data.csvColumns} CSV columns`);
+    console.log(`  replication     ${report.replication.objects} objects · ${report.replication.deltas} deltas · ${report.replication.rpcs} RPCs · ${report.replication.conflicts} conflicts · tick ${report.replication.tick}`);
+    console.log(`  world           ${report.world.actors} actors / ${report.world.levels} levels · ${report.world.componentTicks} component ticks · ${report.world.snapshotActors} actors in snapshot`);
     console.log(`  objects         ${report.objects.live} live / ${report.objects.classes} classes, ${report.collector.destroyedHistory} destroyed`);
     console.log(`  input           contexts [${report.input.contexts.join(', ')}] move ${JSON.stringify(report.input.move)} fire ${report.input.fire}`);
     console.log(`  console         ${report.console.commands} commands, ${report.console.variables} variables`);
@@ -305,10 +371,18 @@ async function main() {
     console.log('');
     console.log(engine.tasks.format());
     console.log('');
-    console.log(`  errors          modules ${report.errors.modules} · subsystems ${report.errors.subsystems} · plugins ${report.errors.plugins} · jobs ${report.errors.jobs} · saves ${report.errors.saves} · messages ${report.errors.messages} · tasks ${report.errors.tasks}`);
+    console.log(engine.diagnostics.format());
+    console.log('');
+    console.log(engine.data.format());
+    console.log('');
+    console.log(engine.replication.format());
+    console.log('');
+    console.log(engine.world.format());
+    console.log('');
+    console.log(`  errors          modules ${report.errors.modules} · subsystems ${report.errors.subsystems} · plugins ${report.errors.plugins} · jobs ${report.errors.jobs} · saves ${report.errors.saves} · messages ${report.errors.messages} · tasks ${report.errors.tasks} · diagnostics ${report.errors.diagnostics} · data ${report.errors.data} · replication ${report.errors.replication} · world ${report.errors.world}`);
     console.log('');
     console.log('  reachable through the console:');
-    for (const line of ['engine', 'engine.subsystems', 'engine.modules', 'plugins', 'loc.report', 'engine.assets', 'weapons.list', 'trace.categories', 'save', 'save.verify', 'save.export', 'bus', 'bus.requests', 'events', 'events.drain', 'tasks', 'tasks.drain'].entries()) {
+    for (const line of ['engine', 'engine.subsystems', 'engine.modules', 'plugins', 'loc.report', 'engine.assets', 'weapons.list', 'trace.categories', 'save', 'save.verify', 'save.export', 'bus', 'bus.requests', 'events', 'events.drain', 'tasks', 'tasks.drain', 'diag', 'diag.codes', 'diag.errors', 'data', 'data.get Weapons rifle', 'data.validate', 'net', 'net.actors', 'net.channels', 'world', 'world.actors', 'world.levels', 'world.net'].entries()) {
       const [index, command] = line;
       const result = engine.console.exec(command, { silent: true });
       console.log(`    ${String(index + 1).padStart(2)}. ${command.padEnd(18)} ${result.ok ? 'ok' : 'FAILED'}`);
